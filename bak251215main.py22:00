@@ -1,0 +1,330 @@
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+import uvicorn
+from urllib.parse import urlparse, unquote
+
+
+B32_FUZZY_CONFIG = {
+    "url_mode": "host_plus_path",            # last_segment | host_plus_path | full
+    "treat_domain_like_url": True,
+    "url_joiner": "/",
+
+    # 仅用于“识别/清洗疑似base32输入”的分隔符（不会用于文章->base32的token化）
+    "separators": set("-_./:@?=&%#"),
+    "uppercase_letters": True,
+
+    # 注意：这是“模糊识别用”的别名，会导致 N->1（非可逆）
+    "char_alias": {
+        "O": "0", "o": "0",
+        "I": "1", "i": "1",
+        "L": "1", "l": "1",
+        "Z": "2", "z": "2",
+        "U": "u", "u": "u",
+    },
+
+    "invalid_char_policy": "error",
+    "return_normalized_on_fail": True,
+}
+
+
+app = FastAPI(title="Ultra-Fast Base32 Converter")
+
+
+class PinCode32Service:
+    def __init__(self, config: dict):
+        self.config = config
+
+        # 自定义字符集：小写 'u'（不输出 'U'）
+        self.charset = "0123456789ABCDEFGHJKMNPQRSTuVWXY"
+        self.base = 32
+        self.allowed_set = set(self.charset)
+
+        self.decode_map = {char: idx for idx, char in enumerate(self.charset)}
+
+        # 小写输入支持（除 u 以外映射到对应大写值）
+        for ch, val in list(self.decode_map.items()):
+            if ch.isalpha() and ch != "u":
+                self.decode_map[ch.lower()] = val
+
+        # U 强制当 u
+        self.decode_map["U"] = self.decode_map["u"]
+
+        # ====== 你定义的“新闻文本 token”系统（可扩展） ======
+        # 约定：
+        #   QX -> 空格
+        #   QJ -> '.'
+        #   QB -> '!'
+        #   QQ -> 字面量 'Q'（避免与token前缀冲突）
+        self.text_token_map = {
+            " ": "QX",
+            ".": "QJ",
+            "!": "QB",
+            "Q": "QQ",  # 必须：避免歧义
+        }
+        # 反向表（API 不用，但你本地测试可能想用）
+        self.token_text_map = {v: k for k, v in self.text_token_map.items()}
+
+    def encode(self, number: int) -> str:
+        if number < 0:
+            return "ERROR"
+        if number == 0:
+            return "00"
+
+        result = []
+        while number > 0:
+            number, remainder = divmod(number, self.base)
+            result.append(self.charset[remainder])
+
+        encoded = "".join(reversed(result))
+        return encoded.zfill(2) if len(encoded) < 2 else encoded
+
+    def decode(self, b32_str: str) -> int:
+        policy = (self.config.get("invalid_char_policy", "error") or "error").lower()
+        if policy not in ("error", "skip", "zero"):
+            policy = "error"
+
+        total = 0
+        for ch in b32_str:
+            if ch not in self.decode_map:
+                if policy == "skip":
+                    continue
+                if policy == "zero":
+                    ch = "0"
+                else:
+                    raise ValueError(f"Invalid character: {ch}")
+
+            value = self.decode_map[ch]
+            total = total * self.base + value
+        return total
+
+    # ---------- URL payload 提取（保留你的逻辑） ----------
+    def extract_payload(self, raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return ""
+
+        if "://" in s:
+            try:
+                p = urlparse(s)
+                host = (p.hostname or "").strip()
+                path = (p.path or "").strip("/")
+                query = (p.query or "").strip()
+                frag = (p.fragment or "").strip()
+
+                mode = self.config.get("url_mode", "last_segment")
+                joiner = self.config.get("url_joiner", "/")
+
+                if mode == "last_segment":
+                    return path.split("/")[-1] if path else ""
+                if mode == "host_plus_path":
+                    if host and path:
+                        return host + joiner + path
+                    return host or path
+                if mode == "full":
+                    parts = []
+                    if host:
+                        parts.append(host)
+                    if path:
+                        parts.append(path)
+                    if query:
+                        parts.append(query)
+                    if frag:
+                        parts.append(frag)
+                    return joiner.join(parts)
+
+                return path.split("/")[-1] if path else ""
+            except Exception:
+                return s
+
+        if self.config.get("treat_domain_like_url", True) and "/" in s:
+            head = s.split("/")[0]
+            if "." in head:
+                host = head.strip()
+                path = "/".join(s.split("/")[1:]).strip("/")
+                mode = self.config.get("url_mode", "last_segment")
+                joiner = self.config.get("url_joiner", "/")
+
+                if mode == "last_segment":
+                    return path.split("/")[-1] if path else ""
+                if mode == "host_plus_path":
+                    if host and path:
+                        return host + joiner + path
+                    return host or path
+                if mode == "full":
+                    if host and path:
+                        return host + joiner + path
+                    return host or path
+
+                return path.split("/")[-1] if path else ""
+
+        return s
+
+    # ---------- 判断“输入更像 base32 还是更像新闻文本” ----------
+    def looks_like_base32(self, raw: str) -> bool:
+        if not raw:
+            return False
+        s = raw.strip()
+        if not s:
+            return False
+
+        # 允许用户带一些分隔符；先剥离
+        seps = self.config.get("separators", set())
+        cleaned = "".join(ch for ch in s if ch not in seps)
+
+        # 应用大小写/别名（模糊识别）
+        alias = self.config.get("char_alias", {})
+        out = []
+        for ch in cleaned:
+            if self.config.get("uppercase_letters", True) and ("a" <= ch <= "z"):
+                ch = ch.upper()
+            if ch in alias:
+                ch = alias[ch]
+            out.append(ch)
+        cleaned2 = "".join(out)
+
+        return len(cleaned2) > 0 and all(ch in self.decode_map for ch in cleaned2)
+
+    # ---------- base32 输入的“模糊规范化”（只用于 decode base32） ----------
+    def normalize_for_decode_base32(self, raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return ""
+
+        seps = self.config.get("separators", set())
+        alias = self.config.get("char_alias", {})
+
+        out = []
+        for ch in s:
+            if ch in seps:
+                continue
+            if self.config.get("uppercase_letters", True) and ("a" <= ch <= "z"):
+                ch = ch.upper()
+            if ch in alias:
+                ch = alias[ch]
+            out.append(ch)
+
+        return "".join(out)
+
+    # ---------- 新闻文本 -> B32-safe（N->1：丢大小写/部分标点） ----------
+    def text_to_b32safe(self, raw_text: str) -> str:
+        """
+        把任意英文文本做“干净、可控”的变换，使输出只包含 charset 内字符。
+        你的要求：
+          空格 -> QX
+          '.' -> QJ
+          '!' -> QB
+        额外必须：
+          'Q' -> QQ（避免 token 前缀冲突）
+        同时为了落在字符集内，我们做：
+          - 全部转大写
+          - O/o -> 0, I/L -> 1, Z -> 2, U -> u（保持你之前的模糊策略）
+          - 其余不在字符集内的字符：直接丢弃（你可以后续继续加 token）
+        """
+        if raw_text is None:
+            return ""
+
+        # FastAPI path 通常已解码，但为了稳妥再 unquote 一次（不会伤害纯文本）
+        s = unquote(raw_text)
+
+        # 不要把“文章”当URL再 extract（会丢信息）。这里仅去掉首尾空白。
+        s = s.strip()
+        if not s:
+            return ""
+
+        alias = self.config.get("char_alias", {})
+
+        out = []
+        for ch in s:
+            # token 优先（空格/句点/叹号/字面Q）
+            if ch in self.text_token_map:
+                out.append(self.text_token_map[ch])
+                continue
+
+            # 大小写归一
+            if self.config.get("uppercase_letters", True) and ("a" <= ch <= "z"):
+                ch = ch.upper()
+
+            # 模糊别名（N->1 的关键）
+            if ch in alias:
+                ch = alias[ch]
+
+            # 只保留能落在 charset 的字符；否则丢弃（可按需扩展 token）
+            if ch in self.allowed_set:
+                out.append(ch)
+            # else: 丢弃（比如逗号、引号、换行等）
+        return "".join(out)
+
+
+service = PinCode32Service(B32_FUZZY_CONFIG)
+
+
+@app.get("/", response_class=PlainTextResponse)
+async def index():
+    return (
+        "Ultra-Fast Base32 Converter\n"
+        "Usage:\n"
+        "  /123                      -> encode decimal to custom base32\n"
+        "  /ABCD                     -> decode (fuzzy) custom base32 to decimal\n"
+        "  /ABCDb32                  -> force decode (fuzzy)\n"
+        "  /<any english text/article>-> text -> B32-safe -> decimal\n"
+        "\n"
+        "Text tokens (output is B32-safe):\n"
+        "  QX => space\n"
+        "  QJ => '.'\n"
+        "  QB => '!'\n"
+        "  QQ => literal 'Q'\n"
+    )
+
+
+@app.get("/{input_val:path}", response_class=PlainTextResponse)
+async def unified_converter(input_val: str):
+    input_str = (input_val or "").strip()
+    if not input_str:
+        return "Please provide input. Example: /123 or /ABCD or /I%20love%20My%20mother!"
+
+    # 1) 十进制 -> base32（保持你的性质不变）
+    if input_str.isdigit():
+        try:
+            return service.encode(int(input_str))
+        except Exception:
+            return "Invalid decimal input."
+
+    # 2) 强制 base32 decode（保持原行为）
+    if input_str.lower().endswith("b32"):
+        raw = input_str[:-3]
+        normalized = service.normalize_for_decode_base32(raw)
+        if not normalized:
+            return "No decodable payload found."
+        try:
+            return str(service.decode(normalized))
+        except Exception:
+            if B32_FUZZY_CONFIG.get("return_normalized_on_fail", True):
+                return f"Could not decode. Normalized payload was: {normalized}"
+            return "Could not decode."
+
+    # 3) 非数字：自动判别
+    #    - 若像 base32：走 base32 decode（模糊）
+    #    - 否则：当作新闻文本，做 token/归一化 后再 decode 成十进制
+    if service.looks_like_base32(input_str):
+        normalized = service.normalize_for_decode_base32(input_str)
+        if not normalized:
+            return "No decodable payload found."
+        try:
+            return str(service.decode(normalized))
+        except Exception:
+            if B32_FUZZY_CONFIG.get("return_normalized_on_fail", True):
+                return f"Could not decode. Normalized payload was: {normalized}"
+            return "Could not decode."
+
+    # 4) 文本 -> B32-safe -> 十进制
+    b32safe = service.text_to_b32safe(input_str)
+    if not b32safe:
+        return "No encodable payload found."
+    try:
+        return str(service.decode(b32safe))
+    except Exception as e:
+        return f"Could not encode text to decimal: {e}"
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
